@@ -1,0 +1,172 @@
+name: browser-desktop
+
+on:
+  workflow_dispatch:
+
+# Only one desktop at a time. A second run would otherwise start a second
+# 6-hour job, a second tunnel, and a second URL.
+concurrency:
+  group: browser-desktop
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  webtop:
+    runs-on: ubuntu-latest
+    # 360 is GitHub's hard ceiling for a hosted job. The keep-alive sleeps
+    # 21000s (350 min), leaving headroom for the image pull and setup.
+    timeout-minutes: 360
+
+    env:
+      IMAGE: lscr.io/linuxserver/webtop:ubuntu-xfce
+      # Webtop serves the UI on 3000 (http) and 3001 (https, self-signed).
+      # Cloudflare terminates TLS for us, so we proxy the plain http port.
+      APP_PORT: "3000"
+      # LinuxServer defaults CUSTOM_USER to "abc" when it is unset, so that is
+      # the login username. Set it explicitly instead of relying on the default.
+      CUSTOM_USER: abc
+      TZ_NAME: Asia/Jakarta
+
+    steps:
+      - name: Free disk space
+        run: |
+          # The runner has ~14 GB free and the desktop image is ~5.2 GB.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+
+      - name: Pull desktop image
+        run: docker pull "$IMAGE"
+
+      - name: Start desktop
+        env:
+          # Set WEBTOP_PASS in Settings -> Secrets and variables -> Actions.
+          # This repo is public, so a literal password here would be world-readable.
+          WEBTOP_PASS: ${{ secrets.WEBTOP_PASS }}
+        run: |
+          if [ -z "$WEBTOP_PASS" ]; then
+            echo "::error::Secret WEBTOP_PASS is not set. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          # --shm-size is required: the container defaults to 64 MB of /dev/shm,
+          # which crashes Firefox/Chromium as soon as you open a heavy page.
+          # --restart unless-stopped brings the desktop back if it dies mid-session.
+          docker run -d --name=webtop \
+            --restart unless-stopped \
+            --shm-size=1gb \
+            -p "${APP_PORT}:${APP_PORT}" \
+            -e PASSWORD="$WEBTOP_PASS" \
+            -e CUSTOM_USER="$CUSTOM_USER" \
+            -e TZ="$TZ_NAME" \
+            "$IMAGE"
+
+      - name: Wait for the desktop to answer
+        run: |
+          # Without this the tunnel can come up before Webtop is listening,
+          # which shows the visitor a 502.
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost:${APP_PORT}/" || true)
+            if [ "$code" = "401" ]; then
+              echo "Webtop is up and asking for a password (after ~$((i * 2))s)"
+              break
+            fi
+            if [ "$code" = "200" ]; then
+              echo "::warning::Webtop is answering with NO password. Check the WEBTOP_PASS secret."
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::Webtop never started listening on ${APP_PORT}."
+              docker logs webtop 2>&1 | tail -50
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Start tunnel and publish the URL
+        env:
+          # Needed to exercise the streaming endpoint, which sits behind the same
+          # auth as the UI. Never printed.
+          WEBTOP_PASS: ${{ secrets.WEBTOP_PASS }}
+        run: |
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+
+          # --no-autoupdate so a mid-session self-update cannot kill the tunnel.
+          ./cloudflared tunnel --url "http://localhost:${APP_PORT}" --no-autoupdate > cf.log 2>&1 &
+
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cf.log | head -1)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "::error::cloudflared never printed a URL."
+            cat cf.log
+            exit 1
+          fi
+
+          # A printed hostname is not the same as a live one: the quick-tunnel
+          # hostname still has to propagate through DNS. 401 is the expected
+          # answer (Webtop's auth prompt), so any real HTTP code means "live".
+          code=000
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL/" || true)
+            [ "$code" != "000" ] && break
+            sleep 2
+          done
+
+          if [ "$code" = "000" ]; then
+            echo "::warning::Tunnel hostname is not resolving yet; it usually does within a couple of minutes."
+          fi
+
+          # The page loading does not prove the desktop can stream: Selkies sends
+          # the picture over a WebSocket at /api/websockets. A proxy that blocks
+          # the upgrade gives you a black screen behind a working UI, so verify
+          # the handshake rather than assuming it.
+          ws=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 20 \
+            -u "${CUSTOM_USER}:${WEBTOP_PASS}" \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' \
+            -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+            "$URL/api/websockets" || true)
+
+          {
+            echo "### Browser desktop is ready"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **URL** | [$URL]($URL) |"
+            echo "| **Username** | \`$CUSTOM_USER\` |"
+            echo "| **Password** | the \`WEBTOP_PASS\` secret |"
+            echo "| **HTTP response** | $code (401 is correct: it is the login prompt) |"
+            echo "| **Desktop stream** | $ws (101 is correct: WebSocket upgrade accepted) |"
+            echo "| **Job cap** | 360 minutes |"
+            echo
+            echo "Open the URL in your phone browser, sign in, then launch Chromium inside the desktop."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ws" != "101" ]; then
+            echo "::warning::Desktop stream did not accept a WebSocket upgrade (got $ws). The page may load but show a black screen."
+          fi
+
+          echo "Open: $URL  (user $CUSTOM_USER, HTTP $code, stream $ws)"
+
+      - name: Upload tunnel log
+        # Runs even when the tunnel step failed, so a broken tunnel gives you
+        # the cloudflared error instead of silence.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cf-log
+          path: cf.log
+          if-no-files-found: ignore
+
+      - name: Keep the session alive
+        # Must stay last: the job, the container and the URL all die the moment
+        # this step exits, so every setup step has to come before it.
+        run: sleep 21000
