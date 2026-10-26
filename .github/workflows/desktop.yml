@@ -85,6 +85,10 @@ jobs:
           done
 
       - name: Start tunnel and publish the URL
+        env:
+          # Needed to exercise the streaming endpoint, which sits behind the same
+          # auth as the UI. Never printed.
+          WEBTOP_PASS: ${{ secrets.WEBTOP_PASS }}
         run: |
           curl -fsSL -o cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -120,6 +124,17 @@ jobs:
             echo "::warning::Tunnel hostname is not resolving yet; it usually does within a couple of minutes."
           fi
 
+          # The page loading does not prove the desktop can stream: Selkies sends
+          # the picture over a WebSocket at /api/websockets. A proxy that blocks
+          # the upgrade gives you a black screen behind a working UI, so verify
+          # the handshake rather than assuming it.
+          ws=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 20 \
+            -u "${CUSTOM_USER}:${WEBTOP_PASS}" \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' \
+            -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+            "$URL/api/websockets" || true)
+
           {
             echo "### Browser desktop is ready"
             echo
@@ -129,12 +144,17 @@ jobs:
             echo "| **Username** | \`$CUSTOM_USER\` |"
             echo "| **Password** | the \`WEBTOP_PASS\` secret |"
             echo "| **HTTP response** | $code (401 is correct: it is the login prompt) |"
+            echo "| **Desktop stream** | $ws (101 is correct: WebSocket upgrade accepted) |"
             echo "| **Job cap** | 360 minutes |"
             echo
             echo "Open the URL in your phone browser, sign in, then launch Chromium inside the desktop."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Open: $URL  (user $CUSTOM_USER, HTTP $code)"
+          if [ "$ws" != "101" ]; then
+            echo "::warning::Desktop stream did not accept a WebSocket upgrade (got $ws). The page may load but show a black screen."
+          fi
+
+          echo "Open: $URL  (user $CUSTOM_USER, HTTP $code, stream $ws)"
 
       - name: Upload tunnel log
         # Runs even when the tunnel step failed, so a broken tunnel gives you
